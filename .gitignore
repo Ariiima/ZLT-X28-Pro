@@ -1,0 +1,5 @@
+# personal data: WAN IPs, nearby cell IDs, device settings
+zlt_backup.json
+zlt_scan.json
+__pycache__/
+.DS_Store
