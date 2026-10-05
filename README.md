@@ -3,7 +3,8 @@
 A command-line tool for the **ZLT X28 / X28 Pro** 4G/5G router. It reads the signal and sets the network mode, band lock, and operator through the router's own web API. It can test each band combination and lock the fastest one.
 
 - One file: `zlt.py`. Python 3 standard library only, with no `pip install` step.
-- It uses the normal web login (`admin` / `admin` by default). It does not need root, telnet, or an exploit.
+- It uses the router's own web login. It does not need telnet, SSH, or an exploit.
+- Most commands work with the normal login (`admin` / `admin`). The cell lock needs the higher web login `root` / `admin` (see [Logins](#logins)).
 - The speed tests use servers in Iran by default. You can change them (see [Configuration](#configuration)).
 
 ## Tested on
@@ -52,8 +53,8 @@ Other firmware versions can use different commands. Before you change a setting,
 | `lock 3,7` | Locks 4G to bands B3 and B7. `lock all` removes the lock. `lock 3 78` also locks 5G to n78 | Yes |
 | `operator 43235` | Selects one operator (PLMN). See [Roaming](#roaming) | Yes |
 | `scan` | Tests "no lock", each band, and each band combination, then locks the best | Yes |
-| `scan --cells` | Also tries a PCI lock on the strongest cells (experimental) | Yes |
-| `pcilock 119` / `pcilock off` | Allows only these cells (experimental) | Yes |
+| `scan --cells` | Also tests a cell lock on each cell of your operator (root login) | Yes |
+| `celllock 325:251` / `celllock off` | Locks LTE to one or more `EARFCN:PCI` cells (root login) | Yes |
 
 ### Network modes
 
@@ -64,6 +65,25 @@ Other firmware versions can use different commands. Before you change a setting,
 | `20` | 4G FDD only |
 | `40` | 4G TDD only |
 | `C` / `10` | 5G NSA only / 5G SA only |
+
+## Logins
+
+The web UI has more than one user. On firmware 8.5.4.3:
+
+| User / password | Level | Access |
+|---|---|---|
+| `admin` / `admin` | 3 | Status, band lock, network mode, AT commands, cell scan |
+| `root` / `admin` | 2 | All of the above, plus the cell lock (`cmd 160`) and the PLMN-lock setting (`cmd 219`) |
+
+`superadmin` / `superadmin` and `Admin` / `Conf` did not work on this firmware.
+
+To use the root login:
+
+```
+ZLT_USER=root ZLT_PASS=admin python3 zlt.py celllock 325:251
+```
+
+The router locks the login for 3 minutes after 3 wrong passwords in sequence. A correct login sets the counter back to 0. If you changed the default passwords, use your own.
 
 ## How `scan` works
 
@@ -76,7 +96,8 @@ Other firmware versions can use different commands. Before you change a setting,
    - domestic ping, jitter, and packet loss
    - international ping
 5. It calculates a score: speed, divided by a penalty for ping and jitter. It does not use results where the SIM roams on a different operator.
-6. It locks the best setting and saves all results in `zlt_scan.json`.
+6. With `--cells`, it then tests a cell lock on each cell of your operator. It uses the cells that the modem connected to, plus the 4 strongest neighbour cells on the same frequencies. Each cell lock goes on top of the best band setting.
+7. It locks the best setting and saves all results in `zlt_scan.json`.
 
 A full scan takes about 10–20 minutes. Run it at the time of day when you use the internet most, because the best band can change with network load.
 
@@ -85,8 +106,9 @@ A full scan takes about 10–20 minutes. Run it at the time of day when you use 
 The modem can connect to a different operator through national roaming. For example, a Rightel SIM can use the MCI network. Roaming can cost more.
 
 - `scan` shows `ROAMING` in each result where this occurs, and it does not select those results. To allow them, set `ZLT_ALLOW_ROAMING=1`.
-- `operator <PLMN>` tells the modem to use your own operator. On firmware 8.5.4.3, the module then reports `+COPS: 1` (manual mode). In manual mode, the modem does not change to roaming. But if your operator's signal stops, the internet also stops.
+- **To stop roaming, use `operator <PLMN>`**, for example `python3 zlt.py operator 43220`. On firmware 8.5.4.3, the module then reports `+COPS: 1` (manual mode), and it does not change to roaming. If your operator's signal stops, the internet also stops.
 - To set automatic selection again: `python3 zlt.py at 'AT+COPS=0'`
+- The web UI also has a PLMN-lock setting (`cmd 219`, root login). It does **not** stop roaming. In our test, `lockPlmn=1, lockPlmnList=43220` was on, but with automatic selection and a B7 band lock, the modem still connected to MCI. The tool does not use this setting.
 
 | Operator | PLMN |
 |---|---|
@@ -128,7 +150,8 @@ To find Ookla servers near you, open `https://www.speedtest.net/api/js/servers?e
 
 ## Known limits
 
-- **PCI lock (`pcilock`, `scan --cells`) is experimental.** The web API accepts the setting (`cmd 341`), but in our tests the modem stayed on its old cell. The real cell lock (`cmd 160`) gives `LIMITED_ACCESS` to the `admin` user. The Quectel `AT+QNWLOCK` command is not available on this module (`CME ERROR: 100`).
+- **Cell lock needs the root login.** With `admin`, `cmd 160` gives `LIMITED_ACCESS`. The "ECGI/PCI lock" list (`cmd 341`) accepts settings, but in our tests the modem did not change cell, so the tool does not use it. The Quectel `AT+QNWLOCK` command is not available on this module (`CME ERROR: 100`).
+- **A cell lock can make the speed worse.** If the locked cell has a fault or too many users, the modem cannot move to a better cell. Run `scan --cells` again from time to time, or use `celllock off`.
 - **The international test can show a maximum of about 80 Mbps.** Cloudflare refuses requests above about 25 MB, and the tool uses 4 × 25 MB in 10 s.
 - **The operator scan of the web UI (`cmd 228`) fails** while the data connection is on (error 502). Use `cells` instead.
 - The tool does not change Wi-Fi, APN, DNS, or firewall settings.
@@ -143,11 +166,13 @@ The router's web UI sends JSON to `POST /cgi-bin/http.cgi`. The tool uses these 
 | 233 | Get a new token. Every POST needs a token |
 | 0, 113, 205, 207 | System, status, signal, and device information (`205` has RSRP/SINR/PCI/band) |
 | 161 | Band lock. `lock4gBand` is a hex bitmask, where bit *n−1* = band *n* |
+| 160 | Cell lock (root): `subcmd=0, lte_lock_sw, lte_lock_freq, lte_lock_pci` (comma lists). `lock_4g_flag=1` when locked |
+| 219 | PLMN-lock setting (root): `lockPlmn, lockPlmnList`. It did not stop roaming in our test |
 | 256 | Network mode |
 | 228 | Operator (PLMN) scan and selection |
 | 270 | Send AT command (`atInfo` = base64 of the command) |
 | 282 | Neighbour cells (`earfcn,pci,rsrp,rsrq;…`) |
-| 341 / 342 | PCI lock list / cell scan |
+| 342 | Cell scan of all operators (`pcid_4g, earfcn_4g, rsrp_4g, eci`) |
 
 The router sends an empty reply when a new band lock is the same as the current one. The tool accepts this as success.
 

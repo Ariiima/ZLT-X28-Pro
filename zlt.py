@@ -9,9 +9,11 @@
   python3 zlt.py scan                   # try each visible 4G band, lock the best one (home network only)
   python3 zlt.py operator 43220         # select this network (modem then reports manual mode, see README)
   python3 zlt.py speed                  # domestic + international speed/ping, no changes
-  python3 zlt.py scan --cells           # experimental: also try a PCI lock on each home cell
+  python3 zlt.py scan --cells           # also try a cell lock on each home cell (root login)
   python3 zlt.py cells                  # list nearby LTE cells (all operators)
-  python3 zlt.py pcilock 292,119 | off  # experimental: only allow these cells
+  python3 zlt.py celllock 325:251 | off # lock LTE to earfcn:pci pairs (root login)
+
+The cell lock needs the root web login: ZLT_USER=root ZLT_PASS=admin.
   python3 zlt.py watch                  # live RSRP/SINR every 2 s, for placing the modem
   python3 zlt.py at 'AT+COPS?'          # send one AT command to the Quectel module
 """
@@ -204,10 +206,12 @@ def visible_bands():
     return sorted({b for b in map(band_of, earfcns) if b})
 
 
-def scan(cells=False):
+def scan(try_cells=False):
     if not os.path.exists(BACKUP):
         do_backup()
     print("unlocking all bands to see what is around...")
+    if try_cells:
+        set_cell_lock(None)
     set_bands(None, None)
     st = wait_online()
     print("unlocked:", st)
@@ -215,44 +219,47 @@ def scan(cells=False):
     bands = visible_bands()
     print("visible 4G bands:", bands)
     home = home_plmn()
-    set_pci_lock(None)
     # every band combination: singles, pairs, ..., all (CA needs the combos, not just singles)
     combos = [list(c) for n in range(1, len(bands) + 1) for c in itertools.combinations(bands, n)]
     results = [trial("no lock", None, None, home, st)]
     results += [trial("B" + "+B".join(map(str, c)), c, None, home) for c in combos]
     best = max(results, key=score)
-    if cells:  # then try pinning each home-network cell seen above, on top of the best band set
-        home_ok = [r["st"] for r in results if r["st"] and not r["roaming"]]
-        pcis = {p for s in home_ok for p in s["pci"].split("+")}
-        freqs = {f for s in home_ok for f in s["earfcn"].split("+")}
+    if try_cells:  # then try a cell lock on each home-network cell seen above, on top of the best band set
+        home_ok = [r for r in results if r["st"] and not r["roaming"]]
+        cells = {c for r in home_ok for c in zip(r["st"]["earfcn"].split("+"), r["st"]["pci"].split("+"))}
+        freqs = {f for f, _ in cells}
         # neighbours on the same frequencies belong to the same operator; take the 4 strongest
-        nb = [c.split(",") for c in get(282).get("lte_info", "").split(";") if c]
-        pcis |= set([c[1] for c in sorted(nb, key=lambda c: -int(c[2])) if c[0] in freqs][:4])
-        pcis = sorted(pcis, key=int)
-        results += [trial(f"{best['label']} + PCI {p}", best["bands"], [p], home) for p in pcis]
+        nb = {(c[0], c[1]): int(c[2]) for r in home_ok for c in (x.split(",") for x in r["nb"].split(";") if x)}
+        cells |= set([c for c in sorted(nb, key=nb.get, reverse=True) if c[0] in freqs and c not in cells][:4])
+        results += [trial(f"{best['label']} + cell {f}:{p}", best["bands"], [(f, p)], home) for f, p in sorted(cells)]
         best = max(results, key=score)
     if score(best) <= 0:
         print("nothing usable on the home network, restoring backup")
-        set_pci_lock(None)
+        if try_cells:
+            set_cell_lock(None)
         return do_restore()
     print("BEST:", best["label"], {k: best.get(k) for k in ("dl_ir", "ul_ir", "ping_ir", "jitter_ir", "dl_int", "ping_int")})
     set_bands(best["bands"], None)
-    set_pci_lock(best["pcis"])
-    print("final:", wait_online())
+    if try_cells:
+        set_cell_lock(best["cells"])
+    print("final:", wait_online(180))
     json.dump(results, open(os.path.join(os.path.dirname(BACKUP), "zlt_scan.json"), "w"), indent=1, ensure_ascii=False)
 
 
-def trial(label, bands, pcis, home, st=None):
+def trial(label, bands, cells, home, st=None):
     try:
         if st is None:
             set_bands(bands, None)
-            set_pci_lock(pcis)
-            st = wait_online()
-        r = {"label": label, "bands": bands, "pcis": pcis, "st": st, **(measure() if st else {})}
+            if cells:
+                set_cell_lock(cells)
+            st = wait_online(180)
+        r = {"label": label, "bands": bands, "cells": cells, "st": st, **(measure() if st else {})}
     except Exception as e:
-        r = {"label": label, "bands": bands, "pcis": pcis, "st": None, "err": str(e)}
+        r = {"label": label, "bands": bands, "cells": cells, "st": None, "err": str(e)}
     s = r["st"] or {}
     r["roaming"] = bool(s) and s.get("plmn") != home
+    if s and not r["roaming"]:  # neighbours of a home cell; read now, while still on the home network
+        r["nb"] = get(282).get("lte_info", "")
     if r["roaming"] and not ALLOW_ROAMING:
         r["ping_ir"] = None  # score() -> -1: never pick a roaming result
     print(f"  {label}: {s.get('op')}{' ROAMING' if r['roaming'] else ''} {s.get('band')} pci={s.get('pci')} "
@@ -270,9 +277,14 @@ def scan_cells():
             for p, e, s, c in zip(*cols) if p]
 
 
-def set_pci_lock(pcis):
-    """Whitelist of up to 10 LTE PCIs (lockMode 0 = by PCI); None = off."""
-    post(341, pciSwitch="1" if pcis else "0", lockMode="0", pci4gList=",".join(map(str, pcis or [])), pci5gList="")
+def set_cell_lock(cells):
+    """Lock LTE to (earfcn, pci) pairs, e.g. [("325", "251")]; None = off. Needs the root login."""
+    post(160, subcmd=0, lte_lock_sw="1" if cells else "0",
+         lte_lock_freq=",".join(f for f, _ in cells or []), lte_lock_pci=",".join(p for _, p in cells or []))
+
+
+def parse_cells(arg):
+    return None if arg == "off" else [tuple(c.split(":")) for c in arg.split(",")]
 
 
 def watch():
@@ -298,6 +310,7 @@ if __name__ == "__main__":
         assert mask([38, 40, 41, 42, 43]) == "7a000000000" and unmask("7A0880800D5")[:4] == [1, 3, 5, 7]
         assert band_of(39550) == 40 and band_of(1650) == 3 and band_of(300) == 1
         assert score({"ping_ir": None}) == -1 and score({"dl_ir": 40, "dl_int": 20, "ping_ir": 50, "loss": 0}) == 20
+        assert parse_cells("325:251,3102:270") == [("325", "251"), ("3102", "270")] and parse_cells("off") is None
         sys.exit(print("ok"))
     login()
     if a[0] == "status":
@@ -311,11 +324,11 @@ if __name__ == "__main__":
     elif a[0] == "lock":
         set_bands(*parse_lock(a[1:])); print(wait_online())
     elif a[0] == "scan":
-        scan(cells="--cells" in a)
+        scan(try_cells="--cells" in a)
     elif a[0] == "cells":
         for c in sorted(scan_cells(), key=lambda c: c["rsrp"], reverse=True): print(c)
-    elif a[0] == "pcilock":
-        set_pci_lock(None if a[1] == "off" else a[1].split(",")); print(wait_online())
+    elif a[0] == "celllock":
+        set_cell_lock(parse_cells(a[1])); print(wait_online(180))
     elif a[0] == "watch":
         watch()
     elif a[0] == "at":
