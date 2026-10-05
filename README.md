@@ -18,7 +18,36 @@ A command-line tool for the **ZLT X28 / X28 Pro** 4G/5G router. It reads the sig
 
 Other firmware versions can use different commands. Before you change a setting, run `status` and `backup`.
 
-## Quick start
+## Interactive mode (easiest)
+
+1. Connect your computer to the router (Wi-Fi or LAN cable).
+2. Download `zlt.py`.
+3. Run it without arguments:
+   ```
+   python3 zlt.py
+   ```
+4. Enter the router address, the user, and the password. Press Enter to use the defaults (`192.168.70.1`, `admin`, `admin`). For the cell lock, use the user `root`.
+5. The tool shows the current status and a menu:
+   ```
+    1. Status
+    2. Speed test (no changes)
+    3. Live signal, to find the best position (Ctrl+C to stop)
+    4. Auto scan: find and lock the best setting
+    5. Lock 4G bands
+    6. Network mode
+    7. Operator (stops or selects roaming)
+    8. Cell lock (root login)
+    9. List nearby cells of all operators
+   10. Send an AT command
+   11. Back up settings
+   12. Restore settings
+    0. Quit
+   ```
+6. Type a number and press Enter. The tool asks for the values that it needs, and it shows the equivalent command line.
+
+Press Ctrl+C to stop an action and go back to the menu. Press Ctrl+D or `0` to quit.
+
+## Quick start (command line)
 
 1. Connect your computer to the router (Wi-Fi or LAN cable).
 2. Download `zlt.py`.
@@ -53,7 +82,9 @@ Other firmware versions can use different commands. Before you change a setting,
 | `lock 3,7` | Locks 4G to bands B3 and B7. `lock all` removes the lock. `lock 3 78` also locks 5G to n78 | Yes |
 | `operator 43235` | Selects one operator (PLMN). See [Roaming](#roaming) | Yes |
 | `scan` | Tests "no lock", each band, and each band combination, then locks the best | Yes |
-| `scan --cells` | Also tests a cell lock on each cell of your operator (root login) | Yes |
+| `scan --operators 43220,43211` | First compares operators (national roaming included), and keeps the best | Yes |
+| `scan --modes 1C,4` | Compares network modes, and keeps the best | Yes |
+| `scan --cells` | Also tests a cell lock on each cell of the operator in use (root login) | Yes |
 | `celllock 325:251` / `celllock off` | Locks LTE to one or more `EARFCN:PCI` cells (root login) | Yes |
 
 ### Network modes
@@ -87,6 +118,23 @@ The router locks the login for 3 minutes after 3 wrong passwords in sequence. A 
 
 ## How `scan` works
 
+Full example:
+
+```
+ZLT_USER=root ZLT_PASS=admin python3 zlt.py scan --operators 43220,43211 --modes 1C,4 --cells
+```
+
+The scan has 4 phases. Each phase keeps its best result before the next phase starts:
+
+1. **Operators** (`--operators`): it selects each operator, measures, and keeps the best. Roaming results count in this phase, because you asked for them.
+2. **Network modes** (`--modes`): it sets each mode, measures, and keeps the best.
+3. **Bands:** see the steps below.
+4. **Cells** (`--cells`): see step 6 below.
+
+Test all phases, not only the bands. At one location, the operator change (Rightel → MCI national roaming) increased the speed from 21 to 86–125 Mbps. No band setting could do that.
+
+The band phase:
+
 1. It removes the band lock and reads the bands that the modem can see.
 2. It makes a list of tests: "no lock", each band alone, each pair, and all bands together. Carrier aggregation needs band combinations, so single bands are not enough.
 3. For each test, it sets the lock, waits until the modem is online, and measures 2 times. It keeps the median, because tower load changes from minute to minute.
@@ -105,7 +153,8 @@ A full scan takes about 10–20 minutes. Run it at the time of day when you use 
 
 The modem can connect to a different operator through national roaming. For example, a Rightel SIM can use the MCI network. Roaming can cost more.
 
-- `scan` shows `ROAMING` in each result where this occurs, and it does not select those results. To allow them, set `ZLT_ALLOW_ROAMING=1`.
+- `scan` shows `ROAMING` in each result where this occurs, and it does not select those results. To allow them, set `ZLT_ALLOW_ROAMING=1`. Roaming results also count when you use `--operators`, or when you selected a roaming operator by hand with `operator`.
+- Before you use roaming, find out what it costs. In one test, Rightel removed the same data volume on MCI national roaming as on its own network (1:1). Calls can cost more on roaming.
 - **To stop roaming, use `operator <PLMN>`**, for example `python3 zlt.py operator 43220`. On firmware 8.5.4.3, the module then reports `+COPS: 1` (manual mode), and it does not change to roaming. If your operator's signal stops, the internet also stops.
 - To set automatic selection again: `python3 zlt.py at 'AT+COPS=0'`
 - The web UI also has a PLMN-lock setting (`cmd 219`, root login). It does **not** stop roaming. In our test, `lockPlmn=1, lockPlmnList=43220` was on, but with automatic selection and a B7 band lock, the modem still connected to MCI. The tool does not use this setting.

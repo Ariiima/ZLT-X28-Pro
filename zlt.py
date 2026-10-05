@@ -1,23 +1,24 @@
 #!/usr/bin/env python3
 """ZLT X28 Pro helper: status, backup/restore, network mode, band lock, best-band scan.
 
+  python3 zlt.py                        # interactive menu (asks for address, user, password)
   python3 zlt.py status
-  python3 zlt.py backup                 # writes zlt_backup.json
-  python3 zlt.py restore                # puts zlt_backup.json back
-  python3 zlt.py mode 1C                # 1C = 5G SA+NSA/4G, 4 = 4G only, 40 = 4G TDD only
-  python3 zlt.py lock 3,1 [n78]         # lock 4G bands (and optional 5G bands); "lock all" unlocks
-  python3 zlt.py scan                   # try each visible 4G band, lock the best one (home network only)
-  python3 zlt.py operator 43220         # select this network (modem then reports manual mode, see README)
   python3 zlt.py speed                  # domestic + international speed/ping, no changes
-  python3 zlt.py scan --cells           # also try a cell lock on each home cell (root login)
+  python3 zlt.py watch                  # live RSRP/SINR every 2 s, for placing the modem
+  python3 zlt.py backup | restore       # zlt_backup.json
+  python3 zlt.py mode 1C                # 1C = 5G SA+NSA/4G, 4 = 4G only, 40 = 4G TDD only
+  python3 zlt.py lock 3,1 [78]          # lock 4G bands (and optional 5G bands); "lock all" unlocks
+  python3 zlt.py operator 43220         # select this network (modem then reports manual mode, see README)
   python3 zlt.py cells                  # list nearby LTE cells (all operators)
   python3 zlt.py celllock 325:251 | off # lock LTE to earfcn:pci pairs (root login)
+  python3 zlt.py at 'AT+COPS?'          # send one AT command to the Quectel module
+  python3 zlt.py scan [--operators 43220,43211] [--modes 1C,4] [--cells]
+                                        # test operators, then modes, then every band combo, then cells;
+                                        # each phase keeps its winner; locks the best result
 
 The cell lock needs the root web login: ZLT_USER=root ZLT_PASS=admin.
-  python3 zlt.py watch                  # live RSRP/SINR every 2 s, for placing the modem
-  python3 zlt.py at 'AT+COPS?'          # send one AT command to the Quectel module
 """
-import hashlib, itertools, json, os, random, re, statistics, subprocess, sys, time, urllib.request
+import base64, getpass, hashlib, itertools, json, os, random, re, statistics, subprocess, sys, time, urllib.request
 
 HOST = os.environ.get("ZLT_HOST", "192.168.70.1")
 USER, PASS = os.environ.get("ZLT_USER", "admin"), os.environ.get("ZLT_PASS", "admin")
@@ -174,6 +175,11 @@ def score(r):
     return speed / (1 + (r["ping_ir"] + 2 * (r.get("jitter_ir") or 0)) / 100) * (1 - r["loss"] / 100)
 
 
+def at(cmd):
+    """Send one AT command to the radio module; returns its reply text."""
+    return post(270, atInfo=base64.b64encode(cmd.encode()).decode()).get("flag", "")
+
+
 def home_plmn():
     return get(207).get("IMSI", "")[:5]
 
@@ -206,33 +212,67 @@ def visible_bands():
     return sorted({b for b in map(band_of, earfcns) if b})
 
 
-def scan(try_cells=False):
+def scan(try_cells=False, modes=(), operators=()):
+    """Phases: operators -> network modes -> band combos -> cells. Each phase keeps its winner.
+    ponytail: greedy per phase, not the full cross product (that would take hours)."""
+    global ALLOW_ROAMING
     if not os.path.exists(BACKUP):
         do_backup()
+    home = home_plmn()
+    m = re.search(r"\+COPS:\s*1,\d,'(\d+)'", at("AT+COPS?"))
+    if m and m[1] != home and not ALLOW_ROAMING:  # the user chose this network by hand, so allow it
+        print(f"manual operator {PLMN.get(m[1], m[1])} (roaming) is set: roaming results count")
+        ALLOW_ROAMING = True
     print("unlocking all bands to see what is around...")
     if try_cells:
         set_cell_lock(None)
     set_bands(None, None)
+    results = []
+    if operators:
+        ALLOW_ROAMING = True  # the user asked to compare operators, so roaming results count
+        phase = []
+        for p in operators:
+            set_operator(p)
+            r = trial(f"operator {PLMN.get(p, p)}", None, None, home, wait_online(200))
+            r["operator"] = p
+            phase.append(r)
+        results += phase
+        win = max(phase, key=score)["operator"]
+        print("-> operator:", PLMN.get(win, win))
+        set_operator(win)
+    if modes:
+        phase = []
+        for m in modes:
+            set_mode(m)
+            r = trial(f"mode {m}", None, None, home, wait_online())
+            r["mode"] = m
+            phase.append(r)
+        results += phase
+        win = max(phase, key=score)["mode"]
+        print("-> mode:", win)
+        set_mode(win)
     st = wait_online()
     print("unlocked:", st)
     time.sleep(10)  # let the modem collect neighbour measurements
     bands = visible_bands()
     print("visible 4G bands:", bands)
-    home = home_plmn()
     # every band combination: singles, pairs, ..., all (CA needs the combos, not just singles)
     combos = [list(c) for n in range(1, len(bands) + 1) for c in itertools.combinations(bands, n)]
-    results = [trial("no lock", None, None, home, st)]
-    results += [trial("B" + "+B".join(map(str, c)), c, None, home) for c in combos]
-    best = max(results, key=score)
+    phase = [trial("no lock", None, None, home, st)]
+    phase += [trial("B" + "+B".join(map(str, c)), c, None, home) for c in combos]
+    results += phase
+    best = max(phase, key=score)
     if try_cells:  # then try a cell lock on each home-network cell seen above, on top of the best band set
-        home_ok = [r for r in results if r["st"] and not r["roaming"]]
-        cells = {c for r in home_ok for c in zip(r["st"]["earfcn"].split("+"), r["st"]["pci"].split("+"))}
+        op = best["st"]["plmn"] if best["st"] else None  # cells of the operator in use now
+        ok = [r for r in phase if r["st"] and r["st"]["plmn"] == op]
+        cells = {c for r in ok for c in zip(r["st"]["earfcn"].split("+"), r["st"]["pci"].split("+"))}
         freqs = {f for f, _ in cells}
         # neighbours on the same frequencies belong to the same operator; take the 4 strongest
-        nb = {(c[0], c[1]): int(c[2]) for r in home_ok for c in (x.split(",") for x in r["nb"].split(";") if x)}
+        nb = {(c[0], c[1]): int(c[2]) for r in ok for c in (x.split(",") for x in r.get("nb", "").split(";") if x)}
         cells |= set([c for c in sorted(nb, key=nb.get, reverse=True) if c[0] in freqs and c not in cells][:4])
-        results += [trial(f"{best['label']} + cell {f}:{p}", best["bands"], [(f, p)], home) for f, p in sorted(cells)]
-        best = max(results, key=score)
+        phase += [trial(f"{best['label']} + cell {f}:{p}", best["bands"], [(f, p)], home) for f, p in sorted(cells)]
+        results += phase[len(combos) + 1:]
+        best = max(phase, key=score)
     if score(best) <= 0:
         print("nothing usable on the home network, restoring backup")
         if try_cells:
@@ -258,7 +298,7 @@ def trial(label, bands, cells, home, st=None):
         r = {"label": label, "bands": bands, "cells": cells, "st": None, "err": str(e)}
     s = r["st"] or {}
     r["roaming"] = bool(s) and s.get("plmn") != home
-    if s and not r["roaming"]:  # neighbours of a home cell; read now, while still on the home network
+    if s:  # neighbours of the serving cell; read now, while still on this network
         r["nb"] = get(282).get("lte_info", "")
     if r["roaming"] and not ALLOW_ROAMING:
         r["ping_ir"] = None  # score() -> -1: never pick a roaming result
@@ -304,15 +344,12 @@ def parse_lock(args):
     return b4, b5
 
 
-if __name__ == "__main__":
-    a = sys.argv[1:] or ["status"]
-    if a[0] == "test":  # offline self-check against values read from this modem
-        assert mask([38, 40, 41, 42, 43]) == "7a000000000" and unmask("7A0880800D5")[:4] == [1, 3, 5, 7]
-        assert band_of(39550) == 40 and band_of(1650) == 3 and band_of(300) == 1
-        assert score({"ping_ir": None}) == -1 and score({"dl_ir": 40, "dl_int": 20, "ping_ir": 50, "loss": 0}) == 20
-        assert parse_cells("325:251,3102:270") == [("325", "251"), ("3102", "270")] and parse_cells("off") is None
-        sys.exit(print("ok"))
-    login()
+def opt(a, name):
+    """'--modes 1C,4' -> ['1C', '4']; missing -> []."""
+    return a[a.index(name) + 1].split(",") if name in a and a.index(name) + 1 < len(a) else []
+
+
+def run(a):
     if a[0] == "status":
         show_status()
     elif a[0] == "backup":
@@ -324,7 +361,7 @@ if __name__ == "__main__":
     elif a[0] == "lock":
         set_bands(*parse_lock(a[1:])); print(wait_online())
     elif a[0] == "scan":
-        scan(try_cells="--cells" in a)
+        scan(try_cells="--cells" in a, modes=opt(a, "--modes"), operators=opt(a, "--operators"))
     elif a[0] == "cells":
         for c in sorted(scan_cells(), key=lambda c: c["rsrp"], reverse=True): print(c)
     elif a[0] == "celllock":
@@ -332,10 +369,95 @@ if __name__ == "__main__":
     elif a[0] == "watch":
         watch()
     elif a[0] == "at":
-        import base64; print(post(270, atInfo=base64.b64encode(a[1].encode()).decode()).get("flag"))
+        print(at(a[1]))
     elif a[0] == "operator":
         set_operator(a[1], a[2] if len(a) > 2 else "7"); print(wait_online(200))
     elif a[0] == "speed":
         print(status()); print(measure())
     else:
         print(__doc__)
+
+
+def ask(prompt, default=""):
+    v = input(f"{prompt}{f' [{default}]' if default else ''}: ").strip()
+    return v or default
+
+
+def ask_scan():
+    print("Operators to compare (PLMN codes). " + ", ".join(f"{k}={v}" for k, v in PLMN.items()))
+    ops = ask("Operators, comma-separated (Enter = keep the current one)")
+    modes = ask("Network modes to compare, e.g. 1C,4 (Enter = keep the current mode)")
+    cells = ask("Also test a cell lock on each cell? Needs the root login (y/N)", "n").lower().startswith("y")
+    print("The internet stops for short periods. A full scan takes 10-40 minutes.")
+    return ["scan"] + (["--operators", ops] if ops else []) + (["--modes", modes] if modes else []) + (["--cells"] if cells else [])
+
+
+MENU = [
+    ("Status", lambda: ["status"]),
+    ("Speed test (no changes)", lambda: ["speed"]),
+    ("Live signal, to find the best position (Ctrl+C to stop)", lambda: ["watch"]),
+    ("Auto scan: find and lock the best setting", ask_scan),
+    ("Lock 4G bands", lambda: ["lock", ask("4G bands, e.g. 1,3,7 (all = no lock)", "all")]),
+    ("Network mode", lambda: ["mode", ask("1C = 5G+4G, 4 = 4G only, 20 = 4G FDD, 40 = 4G TDD, C = 5G NSA, 10 = 5G SA", "1C")]),
+    ("Operator (stops or selects roaming)", lambda: ["operator", ask(", ".join(f"{k}={v}" for k, v in PLMN.items()))]),
+    ("Cell lock (root login)", lambda: ["celllock", ask("EARFCN:PCI, e.g. 325:251 (off = no lock)", "off")]),
+    ("List nearby cells of all operators", lambda: ["cells"]),
+    ("Send an AT command", lambda: ["at", ask("AT command", "AT+COPS?")]),
+    ("Back up settings", lambda: ["backup"]),
+    ("Restore settings", lambda: ["restore"]),
+]
+
+
+def interactive():
+    global HOST, USER, PASS, URL
+    print("ZLT X28 / X28 Pro tool. Press Ctrl+C to stop an action, or Ctrl+D to quit.\n")
+    HOST = ask("Router address", HOST)
+    URL = f"http://{HOST}/cgi-bin/http.cgi"
+    while True:
+        USER = ask("User (admin, or root for the cell lock)", USER)
+        PASS = getpass.getpass(f"Password for {USER} (Enter = default 'admin'): ") or PASS
+        try:
+            login()
+            break
+        except SystemExit as e:
+            print(f"{e}\nWrong user or password. After 3 wrong tries, the router locks the login for 3 minutes.")
+    run(["status"])
+    while True:
+        print()
+        for i, (name, _) in enumerate(MENU, 1):
+            print(f"{i:2}. {name}")
+        print(" 0. Quit")
+        try:
+            c = ask("Select")
+            if c in ("0", "q"):
+                return
+            if not c.isdigit() or not 1 <= int(c) <= len(MENU):
+                continue
+            args = MENU[int(c) - 1][1]()
+            print("$ zlt.py " + " ".join(args))
+            run(args)
+        except KeyboardInterrupt:
+            print("\nstopped")
+        except EOFError:
+            return print()
+        except Exception as e:
+            print("error:", e, "(the cell lock needs the root login)" if "LIMITED_ACCESS" in str(e) else "")
+
+
+if __name__ == "__main__":
+    a = sys.argv[1:]
+    if a and a[0] == "test":  # offline self-check against values read from this modem
+        assert mask([38, 40, 41, 42, 43]) == "7a000000000" and unmask("7A0880800D5")[:4] == [1, 3, 5, 7]
+        assert band_of(39550) == 40 and band_of(1650) == 3 and band_of(300) == 1
+        assert score({"ping_ir": None}) == -1 and score({"dl_ir": 40, "dl_int": 20, "ping_ir": 50, "loss": 0}) == 20
+        assert parse_cells("325:251,3102:270") == [("325", "251"), ("3102", "270")] and parse_cells("off") is None
+        assert opt(["scan", "--modes", "1C,4", "--cells"], "--modes") == ["1C", "4"] and opt(["scan"], "--modes") == []
+        sys.exit(print("ok"))
+    if not a:
+        try:
+            interactive()
+        except (KeyboardInterrupt, EOFError):
+            print()
+    else:
+        login()
+        run(a)
