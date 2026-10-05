@@ -2,6 +2,7 @@
 """ZLT X28 Pro helper: status, backup/restore, network mode, band lock, best-band scan.
 
   python3 zlt.py                        # interactive menu (asks for address, user, password)
+  python3 zlt.py auto                   # easy auto-setup: 2 questions, tests everything, keeps the fastest
   python3 zlt.py status
   python3 zlt.py speed                  # domestic + international speed/ping, no changes
   python3 zlt.py watch                  # live RSRP/SINR every 2 s, for placing the modem
@@ -190,19 +191,30 @@ def set_operator(plmn, act="7"):
     post(228, plmn_select_cmd="4", plmn=plmn, act=act)
 
 
+def snapshot():
+    """Current network mode, band lock and operator selection (manual PLMN or automatic)."""
+    m = re.search(r"\+COPS:\s*(\d)(?:,\d,'(\d+)')?", at("AT+COPS?"))
+    return {"networkMode": get(256)["networkMode"], "lock_band": get(161),
+            "cops": {"mode": m[1], "plmn": m[2]} if m else None}
+
+
 def do_backup():
-    lb, nm = get(161), get(256)
-    json.dump({"networkMode": nm["networkMode"], "lock_band": lb}, open(BACKUP, "w"), indent=1)
+    json.dump(snapshot(), open(BACKUP, "w"), indent=1)
     print("saved", BACKUP)
 
 
-def do_restore():
-    b = json.load(open(BACKUP))
+def do_restore(snap=None):
+    b = snap or json.load(open(BACKUP))
     lb = b["lock_band"]
     set_mode(b["networkMode"])
     post(161, band4gRadio=lb["band_4g_switch"], lock4gBand=lb["lock_band_4g"].lower(),
          band5gRadio=lb["band_5g_switch"], lock5gBand=lb["lock_band_5g"].lower())
-    print("restored; online:", wait_online())
+    c = b.get("cops")  # older backup files have no operator entry
+    if c and c["mode"] == "1" and c["plmn"]:
+        set_operator(c["plmn"])
+    elif c:
+        at("AT+COPS=0")
+    print("restored; online:", wait_online(200))
 
 
 def visible_bands():
@@ -216,6 +228,7 @@ def scan(try_cells=False, modes=(), operators=()):
     """Phases: operators -> network modes -> band combos -> cells. Each phase keeps its winner.
     ponytail: greedy per phase, not the full cross product (that would take hours)."""
     global ALLOW_ROAMING
+    snap = snapshot()  # fresh copy; an old zlt_backup.json can hold a bad setting
     if not os.path.exists(BACKUP):
         do_backup()
     home = home_plmn()
@@ -273,17 +286,19 @@ def scan(try_cells=False, modes=(), operators=()):
         phase += [trial(f"{best['label']} + cell {f}:{p}", best["bands"], [(f, p)], home) for f, p in sorted(cells)]
         results += phase[len(combos) + 1:]
         best = max(phase, key=score)
+    json.dump(results, open(os.path.join(os.path.dirname(BACKUP), "zlt_scan.json"), "w"), indent=1, ensure_ascii=False)
     if score(best) <= 0:
-        print("nothing usable on the home network, restoring backup")
+        print("nothing usable, putting back the settings from before the scan")
         if try_cells:
             set_cell_lock(None)
-        return do_restore()
+        do_restore(snap)
+        return None
     print("BEST:", best["label"], {k: best.get(k) for k in ("dl_ir", "ul_ir", "ping_ir", "jitter_ir", "dl_int", "ping_int")})
     set_bands(best["bands"], None)
     if try_cells:
         set_cell_lock(best["cells"])
     print("final:", wait_online(180))
-    json.dump(results, open(os.path.join(os.path.dirname(BACKUP), "zlt_scan.json"), "w"), indent=1, ensure_ascii=False)
+    return best
 
 
 def trial(label, bands, cells, home, st=None):
@@ -362,6 +377,8 @@ def run(a):
         set_bands(*parse_lock(a[1:])); print(wait_online())
     elif a[0] == "scan":
         scan(try_cells="--cells" in a, modes=opt(a, "--modes"), operators=opt(a, "--operators"))
+    elif a[0] == "auto":
+        easy_setup()
     elif a[0] == "cells":
         for c in sorted(scan_cells(), key=lambda c: c["rsrp"], reverse=True): print(c)
     elif a[0] == "celllock":
@@ -383,6 +400,66 @@ def ask(prompt, default=""):
     return v or default
 
 
+def yes(prompt, default=False):
+    v = ask(prompt + (" (Y/n)" if default else " (y/N)")).lower()
+    return v.startswith("y") if v else default
+
+
+MODE_NAMES = {"1C": "5G + 4G", "4": "4G only", "20": "4G FDD only", "40": "4G TDD only", "C": "5G NSA only", "10": "5G SA only"}
+IR_OPERATORS = ["43211", "43235", "43220"]  # MCI, Irancell, Rightel: candidates for national roaming
+
+
+def fmt(r):
+    if r.get("ping_ir") is None:
+        return "no connection"
+    return (f"{r['dl_ir']:.0f} Mbps download, {r['ul_ir']:.0f} Mbps upload, ping {r['ping_ir']:.0f} ms (domestic); "
+            f"{r['dl_int']:.0f} Mbps download (international)")
+
+
+def describe(home):
+    s, lb, m = status(), get(161), get(256)["networkMode"].upper()
+    bands = ", ".join(f"B{b}" for b in unmask(lb["lock_band_4g"])) if lb["band_4g_switch"] == "1" else "all (no lock)"
+    return (f"  Operator: {s['op']}{' (national roaming)' if s['plmn'] != home else ''}\n"
+            f"  Network:  {MODE_NAMES.get(m, m)}\n  4G bands: {bands}\n  Signal:   RSRP {s['rsrp']} dBm, SINR {s['sinr']} dB")
+
+
+def easy_setup():
+    """For non-technical users: two questions, then test everything, keep the best, undo if not better."""
+    home = home_plmn()
+    name = PLMN.get(home, home)
+    print("\nEasy auto-setup")
+    print("The tool tests different settings, keeps the fastest one, and sets it for you.")
+    print("If the new setting is not faster, it puts your old setting back.\n")
+    others = [p for p in IR_OPERATORS if p != home] if home in IR_OPERATORS else []
+    roam = bool(others) and yes(
+        f"Your SIM card is {name}. Can the modem also try {' and '.join(PLMN[p] for p in others)} "
+        f"(national roaming)?\nThis can be much faster, but {name} can charge more for it. Ask {name} first.")
+    n = 1 + (len(others) if roam else 0) + 2 + 7 + (5 if USER == "root" else 0)  # rough test count
+    if not yes(f"\nThe test takes about {n * 2}-{n * 3} minutes. The internet stops for short periods. Start?", True):
+        return
+    snap = snapshot()
+    print("\nStep 1 of 3: measuring your current speed...")
+    before = measure()
+    print("  Now:", fmt(before))
+    if not roam and status()["plmn"] != home:
+        set_operator(home)  # the user said no roaming: go back to the own network before the test
+    print("\nStep 2 of 3: testing settings. This takes a while (technical details below)...")
+    best = scan(try_cells=USER == "root", modes=["1C", "4"], operators=[home] + others if roam else ())
+    print("\nStep 3 of 3: measuring the new speed...")
+    after = measure()
+    # ponytail: 10% margin, so measurement noise does not undo a real improvement
+    if best is None or score(after) < 0.9 * score(before):
+        print("\nThe new setting is not faster than your old setting. Putting your old setting back...")
+        if USER == "root":
+            set_cell_lock(None)  # ponytail: an old cell lock is not restored, only removed
+        do_restore(snap)
+        after = measure()
+    print("\nDone.")
+    print("  Before:", fmt(before))
+    print("  After: ", fmt(after))
+    print(describe(home))
+
+
 def ask_scan():
     print("Operators to compare (PLMN codes). " + ", ".join(f"{k}={v}" for k, v in PLMN.items()))
     ops = ask("Operators, comma-separated (Enter = keep the current one)")
@@ -393,12 +470,13 @@ def ask_scan():
 
 
 MENU = [
+    ("Easy auto-setup: find and set the fastest setting for me (recommended)", lambda: ["auto"]),
     ("Status", lambda: ["status"]),
     ("Speed test (no changes)", lambda: ["speed"]),
     ("Live signal, to find the best position (Ctrl+C to stop)", lambda: ["watch"]),
-    ("Auto scan: find and lock the best setting", ask_scan),
+    ("Auto scan with my own choices (advanced)", ask_scan),
     ("Lock 4G bands", lambda: ["lock", ask("4G bands, e.g. 1,3,7 (all = no lock)", "all")]),
-    ("Network mode", lambda: ["mode", ask("1C = 5G+4G, 4 = 4G only, 20 = 4G FDD, 40 = 4G TDD, C = 5G NSA, 10 = 5G SA", "1C")]),
+    ("Network mode", lambda: ["mode", ask(", ".join(f"{k} = {v}" for k, v in MODE_NAMES.items()), "1C")]),
     ("Operator (stops or selects roaming)", lambda: ["operator", ask(", ".join(f"{k}={v}" for k, v in PLMN.items()))]),
     ("Cell lock (root login)", lambda: ["celllock", ask("EARFCN:PCI, e.g. 325:251 (off = no lock)", "off")]),
     ("List nearby cells of all operators", lambda: ["cells"]),
@@ -452,6 +530,8 @@ if __name__ == "__main__":
         assert score({"ping_ir": None}) == -1 and score({"dl_ir": 40, "dl_int": 20, "ping_ir": 50, "loss": 0}) == 20
         assert parse_cells("325:251,3102:270") == [("325", "251"), ("3102", "270")] and parse_cells("off") is None
         assert opt(["scan", "--modes", "1C,4", "--cells"], "--modes") == ["1C", "4"] and opt(["scan"], "--modes") == []
+        assert fmt({"ping_ir": None}) == "no connection" and fmt(
+            {"dl_ir": 86.4, "ul_ir": 44.7, "dl_int": 80, "ping_ir": 37.9}).startswith("86 Mbps download, 45 Mbps upload, ping 38 ms")
         sys.exit(print("ok"))
     if not a:
         try:

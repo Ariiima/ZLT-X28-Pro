@@ -18,7 +18,38 @@ A command-line tool for the **ZLT X28 / X28 Pro** 4G/5G router. It reads the sig
 
 Other firmware versions can use different commands. Before you change a setting, run `status` and `backup`.
 
-## Interactive mode (easiest)
+## Easy auto-setup (for everyone)
+
+You do not need to know about bands or networks.
+
+1. Connect your computer to the router (Wi-Fi or LAN cable).
+2. Disconnect your VPN, if you use one. (The tool can test past a VPN on macOS, but this is easier.)
+3. Download `zlt.py`, and run:
+   ```
+   python3 zlt.py auto
+   ```
+4. Answer two questions:
+   - **"Can the modem also try other operators (national roaming)?"** Roaming can be much faster, but your operator can charge more for it. Ask your operator first. If you are not sure, answer **N**.
+   - **"Start?"** The test takes about 15–40 minutes. The internet stops for short periods during the test.
+5. Wait. The tool does these steps by itself:
+   1. It saves your current settings.
+   2. It measures your current speed.
+   3. It tests operators (only if you said yes), network modes, and band combinations. With the `root` login, it also tests cell locks.
+   4. It sets the fastest setting.
+   5. It measures again. If the new setting is not faster, it puts your old setting back.
+6. Read the result:
+   ```
+   Done.
+     Before: 21 Mbps download, 25 Mbps upload, ping 35 ms (domestic); 13 Mbps download (international)
+     After:  86 Mbps download, 45 Mbps upload, ping 38 ms (domestic); 80 Mbps download (international)
+     Operator: MCI (national roaming)
+     Network:  5G + 4G
+     4G bands: B1, B7
+   ```
+
+You can also start the easy setup from the interactive menu (item 1).
+
+## Interactive mode
 
 1. Connect your computer to the router (Wi-Fi or LAN cable).
 2. Download `zlt.py`.
@@ -29,18 +60,19 @@ Other firmware versions can use different commands. Before you change a setting,
 4. Enter the router address, the user, and the password. Press Enter to use the defaults (`192.168.70.1`, `admin`, `admin`). For the cell lock, use the user `root`.
 5. The tool shows the current status and a menu:
    ```
-    1. Status
-    2. Speed test (no changes)
-    3. Live signal, to find the best position (Ctrl+C to stop)
-    4. Auto scan: find and lock the best setting
-    5. Lock 4G bands
-    6. Network mode
-    7. Operator (stops or selects roaming)
-    8. Cell lock (root login)
-    9. List nearby cells of all operators
-   10. Send an AT command
-   11. Back up settings
-   12. Restore settings
+    1. Easy auto-setup: find and set the fastest setting for me (recommended)
+    2. Status
+    3. Speed test (no changes)
+    4. Live signal, to find the best position (Ctrl+C to stop)
+    5. Auto scan with my own choices (advanced)
+    6. Lock 4G bands
+    7. Network mode
+    8. Operator (stops or selects roaming)
+    9. Cell lock (root login)
+   10. List nearby cells of all operators
+   11. Send an AT command
+   12. Back up settings
+   13. Restore settings
     0. Quit
    ```
 6. Type a number and press Enter. The tool asks for the values that it needs, and it shows the equivalent command line.
@@ -77,10 +109,11 @@ Press Ctrl+C to stop an action and go back to the menu. Press Ctrl+D or `0` to q
 | `watch` | Shows RSRP/RSRQ/SINR every 2 s. Use it to find the best position for the router | No |
 | `cells` | Scans all nearby LTE cells of all operators | No (short radio stop) |
 | `at 'AT+COPS?'` | Sends one AT command to the radio module and shows the reply | Depends on the command |
-| `backup` / `restore` | Saves or restores the network mode and band lock (`zlt_backup.json`) | `restore`: yes |
+| `backup` / `restore` | Saves or restores the network mode, band lock, and operator selection (`zlt_backup.json`) | `restore`: yes |
 | `mode 1C` | Sets the network mode (see the table below) | Yes |
 | `lock 3,7` | Locks 4G to bands B3 and B7. `lock all` removes the lock. `lock 3 78` also locks 5G to n78 | Yes |
 | `operator 43235` | Selects one operator (PLMN). See [Roaming](#roaming) | Yes |
+| `auto` | Easy auto-setup: asks 2 questions, tests everything, keeps the fastest, undoes it if not faster | Yes |
 | `scan` | Tests "no lock", each band, and each band combination, then locks the best | Yes |
 | `scan --operators 43220,43211` | First compares operators (national roaming included), and keeps the best | Yes |
 | `scan --modes 1C,4` | Compares network modes, and keeps the best | Yes |
