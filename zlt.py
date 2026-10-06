@@ -13,7 +13,7 @@
   python3 zlt.py cells                  # list nearby LTE cells (all operators)
   python3 zlt.py celllock 325:251 | off # lock LTE to earfcn:pci pairs (root login)
   python3 zlt.py at 'AT+COPS?'          # send one AT command to the Quectel module
-  python3 zlt.py scan [--operators 43220,43211] [--modes 1C,4] [--cells]
+  python3 zlt.py scan [--operators 43220,43211] [--modes 1C,4] [--cells] [--fast]
                                         # test operators, then modes, then every band combo, then cells;
                                         # each phase keeps its winner; locks the best result
 
@@ -33,7 +33,7 @@ DL_INT = os.environ.get("ZLT_DL", "https://speed.cloudflare.com/__down?bytes=250
 UL_IR = os.environ.get("ZLT_UL_IR", "http://speedtest.asiatech.com.prod.hosts.ooklaserver.net:8080/upload")
 ALLOW_ROAMING = os.environ.get("ZLT_ALLOW_ROAMING") == "1"
 REPEAT = int(os.environ.get("ZLT_REPEAT", "2"))  # runs per candidate; median is kept
-BACKUP = os.path.join(os.path.dirname(os.path.abspath(__file__)), "zlt_backup.json")
+BACKUP = os.path.join(os.path.dirname(os.path.realpath(__file__)), "zlt_backup.json")  # realpath: works via the `zlt` symlink
 URL = f"http://{HOST}/cgi-bin/http.cgi"
 SID = ""
 
@@ -161,9 +161,9 @@ def measure_once():
             "ping_ir": ir, "jitter_ir": jit, "ping_int": intl, "loss": loss}
 
 
-def measure(n=REPEAT):
+def measure(n=None):
     """Median of n runs per metric; one run is too noisy (tower load changes by the minute)."""
-    runs = [measure_once() for _ in range(n)]
+    runs = [measure_once() for _ in range(n or REPEAT)]
     med = lambda xs: statistics.median(xs) if xs else None
     return {k: med([r[k] for r in runs if r[k] is not None]) for k in runs[0]}
 
@@ -376,6 +376,9 @@ def run(a):
     elif a[0] == "lock":
         set_bands(*parse_lock(a[1:])); print(wait_online())
     elif a[0] == "scan":
+        global REPEAT
+        if "--fast" in a:
+            REPEAT = 1  # ponytail: fast = one speed run per candidate instead of the median of REPEAT
         scan(try_cells="--cells" in a, modes=opt(a, "--modes"), operators=opt(a, "--operators"))
     elif a[0] == "auto":
         easy_setup()
@@ -471,6 +474,9 @@ def ask_scan():
 
 MENU = [
     ("Easy auto-setup: find and set the fastest setting for me (recommended)", lambda: ["auto"]),
+    ("Fast scan: current operator and mode, test band locks, 1 run each (~5 min)", lambda: ["scan", "--fast"]),
+    ("Full scan: compare MCI, Irancell, Rightel, 5G/4G modes, band locks (+cells as root) (~30-60 min)",
+     lambda: ["scan", "--operators", ",".join(IR_OPERATORS), "--modes", "1C,4"] + (["--cells"] if USER == "root" else [])),
     ("Status", lambda: ["status"]),
     ("Speed test (no changes)", lambda: ["speed"]),
     ("Live signal, to find the best position (Ctrl+C to stop)", lambda: ["watch"]),
@@ -512,7 +518,7 @@ def interactive():
             if not c.isdigit() or not 1 <= int(c) <= len(MENU):
                 continue
             args = MENU[int(c) - 1][1]()
-            print("$ zlt.py " + " ".join(args))
+            print("$ zlt " + " ".join(args))
             run(args)
         except KeyboardInterrupt:
             print("\nstopped")

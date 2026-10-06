@@ -57,6 +57,10 @@ You can also start the easy setup from the interactive menu (item 1).
    ```
    python3 zlt.py
    ```
+   To run it as `zlt` from any folder (macOS/Linux), link it into your `PATH` one time:
+   ```
+   ln -sf "$PWD/zlt.py" ~/.local/bin/zlt
+   ```
 4. Enter the router address, the user, and the password. Press Enter to use the defaults (`192.168.70.1`, `admin`, `admin`). For the cell lock, use the user `root`.
 5. The tool shows the current status and a menu:
    ```
